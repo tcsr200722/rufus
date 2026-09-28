@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Device detection and enumeration
- * Copyright © 2014-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2014-2026 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -38,14 +38,14 @@
 #include "rufus.h"
 #include "missing.h"
 #include "resource.h"
+#include "settings.h"
 #include "msapi_utf8.h"
 #include "localization.h"
 
 #include "drive.h"
 #include "dev.h"
 
-extern StrArray DriveId, DriveName, DriveLabel, DriveHub;
-extern uint32_t DrivePort[MAX_DRIVES];
+extern RUFUS_DRIVE rufus_drive[MAX_DRIVES];
 extern BOOL enable_HDDs, enable_VHDs, use_fake_units, enable_vmdk, usb_debug;
 extern BOOL list_non_usb_removable_drives, its_a_me_mario;
 
@@ -61,12 +61,9 @@ static BOOL GetUSBProperties(char* parent_path, char* device_id, usb_device_prop
 	DEVINST device_inst;
 	USB_NODE_CONNECTION_INFORMATION_EX conn_info;
 	USB_NODE_CONNECTION_INFORMATION_EX_V2 conn_info_v2;
-	PF_INIT(CM_Get_DevNode_Registry_PropertyA, Cfgmgr32);
 
-	if ((parent_path == NULL) || (device_id == NULL) || (props == NULL) ||
-		(pfCM_Get_DevNode_Registry_PropertyA == NULL)) {
+	if ((parent_path == NULL) || (device_id == NULL) || (props == NULL))
 		goto out;
-	}
 
 	cr = CM_Locate_DevNodeA(&device_inst, device_id, 0);
 	if (cr != CR_SUCCESS) {
@@ -76,7 +73,7 @@ static BOOL GetUSBProperties(char* parent_path, char* device_id, usb_device_prop
 
 	props->port = 0;
 	size = sizeof(props->port);
-	cr = pfCM_Get_DevNode_Registry_PropertyA(device_inst, CM_DRP_ADDRESS, NULL, (PVOID)&props->port, &size, 0);
+	cr = CM_Get_DevNode_Registry_PropertyA(device_inst, CM_DRP_ADDRESS, NULL, (PVOID)&props->port, &size, 0);
 	if (cr != CR_SUCCESS) {
 		uprintf("Could not get port for '%s': CR error %d", device_id, cr);
 		goto out;
@@ -106,24 +103,22 @@ static BOOL GetUSBProperties(char* parent_path, char* device_id, usb_device_prop
 		r = TRUE;
 	}
 
-	// In their great wisdom, Microsoft decided to BREAK the USB speed report between Windows 7 and Windows 8
-	if (nWindowsVersion >= WINDOWS_8) {
-		size = sizeof(conn_info_v2);
-		memset(&conn_info_v2, 0, size);
-		conn_info_v2.ConnectionIndex = (ULONG)props->port;
-		conn_info_v2.Length = size;
-		conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
-		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2, &conn_info_v2, size, &conn_info_v2, size, &size, NULL)) {
-			uprintf("Could not get node connection information (V2) for device '%s': %s", device_id, WindowsErrorString());
-		} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
-			props->speed = USB_SPEED_SUPER_PLUS;
-		} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher) {
-			props->speed = USB_SPEED_SUPER;
-		} else if (conn_info_v2.Flags.DeviceIsSuperSpeedPlusCapableOrHigher) {
-			props->lower_speed = 2;
-		} else if (conn_info_v2.Flags.DeviceIsSuperSpeedCapableOrHigher) {
-			props->lower_speed = 1;
-		}
+	// The USB speed report of modern Windows is a complete mess
+	size = sizeof(conn_info_v2);
+	memset(&conn_info_v2, 0, size);
+	conn_info_v2.ConnectionIndex = (ULONG)props->port;
+	conn_info_v2.Length = size;
+	conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
+	if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2, &conn_info_v2, size, &conn_info_v2, size, &size, NULL)) {
+		uprintf("Could not get node connection information (V2) for device '%s': %s", device_id, WindowsErrorString());
+	} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
+		props->speed = USB_SPEED_SUPER_PLUS;
+	} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher) {
+		props->speed = USB_SPEED_SUPER;
+	} else if (conn_info_v2.Flags.DeviceIsSuperSpeedPlusCapableOrHigher) {
+		props->lower_speed = 2;
+	} else if (conn_info_v2.Flags.DeviceIsSuperSpeedCapableOrHigher) {
+		props->lower_speed = 1;
 	}
 
 out:
@@ -142,29 +137,31 @@ BOOL CyclePort(int index)
 	DWORD size;
 	USB_CYCLE_PORT_PARAMS cycle_port;
 
+	if_assert_fails(index < MAX_DRIVES)
+		return -1;
 	// Wait at least 10 secs between resets
 	if (GetTickCount64() < LastReset + 10000ULL) {
 		uprintf("You must wait at least 10 seconds before trying to reset a device");
 		return FALSE;
 	}
 
-	if (DriveHub.String[index] == NULL) {
+	if (rufus_drive[index].hub == NULL) {
 		uprintf("The device you are trying to reset does not appear to be a USB device...");
 		return FALSE;
 	}
 
 	LastReset = GetTickCount64();
 
-	handle = CreateFileA(DriveHub.String[index], GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+	handle = CreateFileA(rufus_drive[index].hub, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
-		uprintf("Could not open %s: %s", DriveHub.String[index], WindowsErrorString());
+		uprintf("Could not open %s: %s", rufus_drive[index].hub, WindowsErrorString());
 		goto out;
 	}
 
 	size = sizeof(cycle_port);
 	memset(&cycle_port, 0, size);
-	cycle_port.ConnectionIndex = DrivePort[index];
-	uprintf("Cycling port %d (reset) on %s", DrivePort[index], DriveHub.String[index]);
+	cycle_port.ConnectionIndex = rufus_drive[index].port;
+	uprintf("Cycling port %d (reset) on %s", rufus_drive[index].port, rufus_drive[index].hub);
 	// As per https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/usbioctl/ni-usbioctl-ioctl_usb_hub_cycle_port
 	// IOCTL_USB_HUB_CYCLE_PORT is not supported on Windows 7, Windows Vista, and Windows Server 2008
 	if (!DeviceIoControl(handle, IOCTL_USB_HUB_CYCLE_PORT, &cycle_port, size, &cycle_port, size, &size, NULL)) {
@@ -194,7 +191,9 @@ int CycleDevice(int index)
 	SP_DEVINFO_DATA dev_info_data;
 	SP_PROPCHANGE_PARAMS propchange_params;
 
-	if ((index < 0) || (safe_strlen(DriveId.String[index]) < 8))
+	if_assert_fails(index < MAX_DRIVES)
+		return ERROR_INVALID_DRIVE;
+	if ((index < 0) || (safe_strlen(rufus_drive[index].id) < 8))
 		return ERROR_INVALID_PARAMETER;
 
 	// Need DIGCF_ALLCLASSES else disabled devices won't be listed.
@@ -213,7 +212,7 @@ int CycleDevice(int index)
 			continue;
 		}
 
-		if (safe_strcmp(DriveId.String[index], device_instance_id) != 0)
+		if (safe_strcmp(rufus_drive[index].id, device_instance_id) != 0)
 			continue;
 
 		found = TRUE;
@@ -290,10 +289,13 @@ static __inline BOOL IsVHD(const char* buffer)
 		"Arsenal_________Virtual_",
 		"KernSafeVirtual_________",
 		"Msft____Virtual_Disk____",
+		"BHYVE__________SATA_DISK",
 		"VMware__VMware_Virtual_S"	// Enabled through a cheat mode, as this lists primary disks on VMWare instances
 	};
 
-	for (i = 0; i < (int)(ARRAYSIZE(vhd_name)-(enable_vmdk?0:1)); i++)
+	if (buffer == NULL || buffer[0] == '\0')
+		return FALSE;
+	for (i = 0; i < (int)(ARRAYSIZE(vhd_name) - (enable_vmdk ? 0 : 1)); i++)
 		if (safe_strstr(buffer, vhd_name[i]) != NULL)
 			return TRUE;
 	return FALSE;
@@ -387,8 +389,7 @@ BOOL GetOpticalMedia(IMG_SAVE* img_save)
 				FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 			if (hDrive == INVALID_HANDLE_VALUE)
 				continue;
-			if (!DeviceIoControl(hDrive, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-				NULL, 0, geometry, sizeof(geometry), &size, NULL))
+			if (!DeviceIoControl(hDrive, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, geometry, sizeof(geometry), &size, NULL))
 				continue;
 			// Rewritable media usually has a one sector
 			if (DiskGeometry->DiskSize.QuadPart <= 4096)
@@ -419,10 +420,23 @@ BOOL GetOpticalMedia(IMG_SAVE* img_save)
 /* For debugging user reports of HDDs vs UFDs */
 //#define FORCED_DEVICE
 #ifdef FORCED_DEVICE
-#define FORCED_VID 0x048D
-#define FORCED_PID 0x1234
-#define FORCED_NAME "VendorCo Disk USB Device"
+#define FORCED_VID 0x1058
+#define FORCED_PID 0x0702
+#define FORCED_NAME "WD 1200BEVExternal USB Device"
 #endif
+
+void ClearDrives(void)
+{
+	int i;
+	for (i = 0; i < MAX_DRIVES && rufus_drive[i].size != 0; i++) {
+		free(rufus_drive[i].id);
+		free(rufus_drive[i].name);
+		free(rufus_drive[i].display_name);
+		free(rufus_drive[i].label);
+		free(rufus_drive[i].hub);
+	}
+	memset(rufus_drive, 0, sizeof(rufus_drive));
+}
 
 /*
  * Refresh the list of USB devices
@@ -455,15 +469,16 @@ BOOL GetDevices(DWORD devnum)
 	// Oh, and we also have card devices (e.g. 'SCSI\DiskO2Micro_SD_...') under the SCSI enumerator...
 	const char* scsi_disk_prefix = "SCSI\\Disk";
 	const char* scsi_card_name[] = {
-		"_SD_", "_SDHC_", "_MMC_", "_MS_", "_MSPro_", "_xDPicture_", "_O2Media_"
+		"_SD_", "_SDHC_", "_SDXC_", "_MMC_", "_MS_", "_MSPro_", "_xDPicture_", "_O2Media_"
 	};
 	const char* usb_speed_name[USB_SPEED_MAX] = { "USB", "USB 1.0", "USB 1.1", "USB 2.0", "USB 3.0", "USB 3.1" };
 	const char* windows_sandbox_vhd_label = "PortableBaseLayer";
 	// Hash table and String Array used to match a Device ID with the parent hub's Device Interface Path
 	htab_table htab_devid = HTAB_EMPTY;
-	StrArray dev_if_path;
+	StrArray dev_if_path = { 0 };
 	char letter_name[] = " (?:)";
 	char drive_name[] = "?:\\";
+	char setting_name[32];
 	char uefi_togo_check[] = "?:\\EFI\\Rufus\\ntfs_x64.efi";
 	char scsi_card_name_copy[16];
 	BOOL r = FALSE, found = FALSE, post_backslash;
@@ -477,16 +492,15 @@ BOOL GetDevices(DWORD devnum)
 	ULONG list_size[ARRAYSIZE(usbstor_name)] = { 0 }, list_start[ARRAYSIZE(usbstor_name)] = { 0 }, full_list_size, ulFlags;
 	HANDLE hDrive;
 	LONG maxwidth = 0;
-	int s, score, drive_number, remove_drive;
-	char drive_letters[27], *device_id, *devid_list = NULL, entry_msg[128];
-	char *p, *label, *entry, buffer[MAX_PATH], str[MAX_PATH], device_instance_id[MAX_PATH], *method_str, *hub_path;
+	int s, u, v, score, drive_number, remove_drive, num_drives = 0;
+	char drive_letters[27], *device_id, *devid_list = NULL, display_msg[128];
+	char *p, *label, *display_name, buffer[4 * KB], str[MAX_PATH], device_instance_id[MAX_PATH], *method_str, *hub_path;
+	uint32_t ignore_vid_pid[MAX_IGNORE_USB];
+	uint64_t drive_size = 0;
 	usb_device_props props;
 
 	IGNORE_RETVAL(ComboBox_ResetContent(hDeviceList));
-	StrArrayClear(&DriveId);
-	StrArrayClear(&DriveName);
-	StrArrayClear(&DriveLabel);
-	StrArrayClear(&DriveHub);
+	ClearDrives();
 	StrArrayCreate(&dev_if_path, 128);
 	// Add a dummy for string index zero, as this is what non matching hashes will point to
 	StrArrayAdd(&dev_if_path, "", TRUE);
@@ -548,7 +562,7 @@ BOOL GetDevices(DWORD devnum)
 	// Build a single list of Device IDs from all the storage enumerators we know of
 	full_list_size = 0;
 	ulFlags = CM_GETIDLIST_FILTER_SERVICE | CM_GETIDLIST_FILTER_PRESENT;
-	for (s=0; s<ARRAYSIZE(usbstor_name); s++) {
+	for (s = 0; s < ARRAYSIZE(usbstor_name); s++) {
 		// Get a list of device IDs for all USB storage devices
 		// This will be used to find if a device is UASP
 		// Also compute the uasp_start index
@@ -560,15 +574,23 @@ BOOL GetDevices(DWORD devnum)
 			full_list_size += list_size[s]-1;	// remove extra NUL terminator
 	}
 	// Compute the card_start index
-	for (s=0; s<ARRAYSIZE(genstor_name); s++) {
+	for (s = 0; s < ARRAYSIZE(genstor_name); s++) {
 		if (strcmp(genstor_name[s], "SD") == 0)
 			card_start = s;
 	}
 
+	// Build the list of USB devices we may want to ignore
+	for (s = 0; s < ARRAYSIZE(ignore_vid_pid); s++) {
+		static_sprintf(setting_name, "IgnoreUsb%02d", s + 1);
+		ignore_vid_pid[s] = ReadSetting32(setting_name);
+	}
+
 	// Better safe than sorry. And yeah, we could have used arrays of
 	// arrays to avoid this, but it's more readable this way.
-	assert((uasp_start > 0) && (uasp_start < ARRAYSIZE(usbstor_name)));
-	assert((card_start > 0) && (card_start < ARRAYSIZE(genstor_name)));
+	if_assert_fails((uasp_start > 0) && (uasp_start < ARRAYSIZE(usbstor_name)))
+		goto out;
+	if_assert_fails((card_start > 0) && (card_start < ARRAYSIZE(genstor_name)))
+		goto out;
 
 	devid_list = NULL;
 	if (full_list_size != 0) {
@@ -578,7 +600,7 @@ BOOL GetDevices(DWORD devnum)
 			uprintf("Could not allocate Device ID list");
 			goto out;
 		}
-		for (s=0, i=0; s<ARRAYSIZE(usbstor_name); s++) {
+		for (s = 0, i = 0; s < ARRAYSIZE(usbstor_name); s++) {
 			list_start[s] = i;
 			if (list_size[s] > 1) {
 				if (CM_Get_Device_ID_ListA(usbstor_name[s], &devid_list[i], list_size[s], ulFlags) != CR_SUCCESS)
@@ -604,9 +626,10 @@ BOOL GetDevices(DWORD devnum)
 		goto out;
 	}
 	dev_info_data.cbSize = sizeof(dev_info_data);
-	for (i=0; SetupDiEnumDeviceInfo(dev_info, i, &dev_info_data); i++) {
+	for (i = 0; num_drives < MAX_DRIVES && SetupDiEnumDeviceInfo(dev_info, i, &dev_info_data); i++) {
 		memset(buffer, 0, sizeof(buffer));
 		memset(&props, 0, sizeof(props));
+		props.vid = -1; props.pid = -1;
 		method_str = "";
 		hub_path = NULL;
 		if (!SetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_ENUMERATOR_NAME,
@@ -643,8 +666,13 @@ BOOL GetDevices(DWORD devnum)
 		// We can't use the friendly name to find if a drive is a VHD, as friendly name string gets translated
 		// according to your locale, so we poke the Hardware ID
 		memset(buffer, 0, sizeof(buffer));
-		props.is_VHD = SetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_HARDWAREID,
-			&data_type, (LPBYTE)buffer, sizeof(buffer), &size) && IsVHD(buffer);
+		r = SetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_HARDWAREID,
+			&data_type, (LPBYTE)buffer, sizeof(buffer), &size);
+		// We should always be able to get a Hardware ID for disk devices, so report an error in debug if we don't
+		if (!r && usb_debug)
+			uprintf("  Error: %s", WindowsErrorString());
+		props.is_VHD = IsVHD(buffer);
+		if (!props.is_VHD)
 		// Additional detection for SCSI card readers
 		if ((!props.is_CARD) && (safe_strnicmp(buffer, scsi_disk_prefix, sizeof(scsi_disk_prefix)-1) == 0)) {
 			for (j = 0; j < ARRAYSIZE(scsi_card_name); j++) {
@@ -655,6 +683,8 @@ BOOL GetDevices(DWORD devnum)
 				}
 				// Also test for "_SD&" instead of "_SD_" and so on to allow for devices like
 				// "SCSI\DiskRicoh_Storage_SD&REV_3.0" to be detected.
+				if_assert_fails(strlen(scsi_card_name_copy) > 1)
+					continue;
 				scsi_card_name_copy[strlen(scsi_card_name_copy) - 1] = '&';
 				if (safe_strstr(buffer, scsi_card_name_copy) != NULL) {
 					props.is_CARD = TRUE;
@@ -668,7 +698,7 @@ BOOL GetDevices(DWORD devnum)
 		if (!SetupDiGetDeviceInstanceIdA(dev_info, &dev_info_data, device_instance_id,
 			sizeof(device_instance_id), &size)) {
 			uprintf("SetupDiGetDeviceInstanceId failed: %s", WindowsErrorString());
-			static_strcpy(device_instance_id, "<N/A>");
+			strcpy(device_instance_id, "<N/A>");
 		}
 
 		memset(buffer, 0, sizeof(buffer));
@@ -709,7 +739,7 @@ BOOL GetDevices(DWORD devnum)
 				method_str = "";
 
 				// If we're not dealing with the USBSTOR part of our list, then this is an UASP device
-				props.is_UASP = ((((uintptr_t)device_id)+2) >= ((uintptr_t)devid_list)+list_start[uasp_start]);
+				props.is_UASP = ((((uintptr_t)device_id) + 2) >= ((uintptr_t)devid_list) + list_start[uasp_start]);
 				// Now get the properties of the device, and its Device ID, which we need to populate the properties
 				ToUpper(device_id);
 				j = htab_hash(device_id, &htab_devid);
@@ -717,19 +747,23 @@ BOOL GetDevices(DWORD devnum)
 
 				// Try to parse the current device_id string for VID:PID
 				// We'll use that if we can't get anything better
-				for (k = 0, l = 0; (k<strlen(device_id)) && (l<2); k++) {
+				for (k = 0, l = 0; (k < strlen(device_id)) && (l < 2); k++) {
 					// The ID is in the form USB_VENDOR_BUSID\VID_xxxx&PID_xxxx\...
 					if (device_id[k] == '\\')
 						post_backslash = TRUE;
 					if (!post_backslash)
 						continue;
 					if (device_id[k] == '_') {
-						props.pid = (uint16_t)strtoul(&device_id[k + 1], NULL, 16);
+						props.pid = (uint16_t)strtoul(&device_id[k + 1], &p, 16);
+						if (p != &device_id[k + 5]) {
+							uuprintf("  WARNING: Could not read PID:VID from string");
+							break;
+						}
 						if (l++ == 0)
 							props.vid = props.pid;
 					}
 				}
-				if (props.vid != 0)
+				if (props.vid != -1 && props.pid != -1)
 					method_str = "[ID]";
 
 				// If the hash didn't match a populated string in dev_if_path[] (htab_devid.table[j].data > 0),
@@ -746,7 +780,7 @@ BOOL GetDevices(DWORD devnum)
 					uuprintf("  Matched with (GP) ID[%03d]: %s", j, device_id);
 				}
 				if ((uintptr_t)htab_devid.table[j].data > 0) {
-					uuprintf("  Matched with Hub[%d]: '%s'", (uintptr_t)htab_devid.table[j].data,
+					uuprintf("  Matched with Hub[%llu]: '%s'", (uintptr_t)htab_devid.table[j].data,
 							dev_if_path.String[(uintptr_t)htab_devid.table[j].data]);
 					if (GetUSBProperties(dev_if_path.String[(uintptr_t)htab_devid.table[j].data], device_id, &props)) {
 						method_str = "";
@@ -761,6 +795,16 @@ BOOL GetDevices(DWORD devnum)
 				break;
 			}
 		}
+		// Windows has the bad habit of appending "SCSI Disk Device" to the description
+		// of UAS devices, which of course screws up detection of device that actually
+		// describe themselves as SCSI-like disks, so replace that with "UAS Device".
+		if (props.is_UASP) {
+			const char scsi_disk_device_str[] = "SCSI Disk Device";
+			const char uas_device_str[] = "UAS Device";
+			char* marker = strstr(buffer, scsi_disk_device_str);
+			if (marker != NULL && marker[sizeof(scsi_disk_device_str)] == 0)
+				memcpy(marker, uas_device_str, sizeof(uas_device_str));
+		}
 		if (props.is_VHD) {
 			uprintf("Found VHD device '%s'", buffer);
 		} else if ((props.is_CARD) && ((!props.is_USB) || ((props.vid == 0) && (props.pid == 0)))) {
@@ -773,7 +817,7 @@ BOOL GetDevices(DWORD devnum)
 			}
 			uprintf("Found non-USB removable device '%s'", buffer);
 		} else {
-			if ((props.vid == 0) && (props.pid == 0)) {
+			if (props.vid == -1 || props.pid == -1) {
 				if (!props.is_USB) {
 					// If we have a non removable SCSI drive and couldn't get a VID:PID,
 					// we are most likely dealing with a system drive => eliminate it!
@@ -782,19 +826,31 @@ BOOL GetDevices(DWORD devnum)
 				}
 				static_strcpy(str, "????:????");	// Couldn't figure VID:PID
 			} else {
+				static_sprintf(str, "%04X:%04X", props.vid, props.pid);
 				// I *REALLY* don't want to erase the devices below by accident.
 				if (its_a_me_mario) {
 					if ((props.vid == 0x0525) && (props.pid == 0x622b))
 						continue;
 					if ((props.vid == 0x0781) && (props.pid == 0x75a0))
 						continue;
+					if ((props.vid == 0x10d6) && (props.pid == 0x1101))
+						continue;
 				}
-				static_sprintf(str, "%04X:%04X", props.vid, props.pid);
+				// Also ignore USB devices that have been specifically flagged by the user
+				for (s = 0; s < ARRAYSIZE(ignore_vid_pid); s++) {
+					if (ignore_vid_pid[s] != 0 && (props.vid == (ignore_vid_pid[s] >> 16)) &&
+						(props.pid == (ignore_vid_pid[s] & 0xffff))) {
+						uprintf("Ignoring '%s' (%s), per user settings", buffer, str);
+						break;
+					}
+				}
+				if (s < ARRAYSIZE(ignore_vid_pid))
+					continue;
 			}
 			if (props.speed >= USB_SPEED_MAX)
 				props.speed = 0;
-			uprintf("Found %s%s%s device '%s' (%s) %s", props.is_UASP?"UAS (":"",
-				usb_speed_name[props.speed], props.is_UASP?")":"", buffer, str, method_str);
+			uprintf("Found %s%s%s device '%s' (%s) %s", props.is_UASP ? "UAS (" : "",
+				usb_speed_name[props.speed], props.is_UASP ? ")" : "", buffer, str, method_str);
 			if (props.lower_speed)
 				uprintf("NOTE: This device is a USB 3.%c device operating at lower speed...", '0' + props.lower_speed - 1);
 		}
@@ -834,8 +890,8 @@ BOOL GetDevices(DWORD devnum)
 				continue;
 			}
 
-			hDrive = CreateFileA(devint_detail_data->DevicePath, GENERIC_READ|GENERIC_WRITE,
-				FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			hDrive = CreateFileWithTimeout(devint_detail_data->DevicePath, GENERIC_READ|GENERIC_WRITE,
+				FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL, 3000);
 			if(hDrive == INVALID_HANDLE_VALUE) {
 				uprintf("Could not open '%s': %s", devint_detail_data->DevicePath, WindowsErrorString());
 				continue;
@@ -852,13 +908,14 @@ BOOL GetDevices(DWORD devnum)
 				safe_free(devint_detail_data);
 				break;
 			}
-			if (GetDriveSize(drive_index) < (MIN_DRIVE_SIZE*MB)) {
-				uprintf("Device eliminated because it is smaller than %d MB", MIN_DRIVE_SIZE);
+			drive_size = GetDriveSize(drive_index);
+			if (drive_size < MIN_DRIVE_SIZE) {
+				uprintf("Device eliminated because it is smaller than %s", SizeToHumanReadable(MIN_DRIVE_SIZE, FALSE, FALSE));
 				safe_free(devint_detail_data);
 				break;
 			}
 
-			if (GetDriveLabel(drive_index, drive_letters, &label)) {
+			if (GetDriveLabel(drive_index, drive_letters, &label, FALSE)) {
 				if ((props.is_SCSI) && (!props.is_UASP) && (!props.is_VHD)) {
 					if (!props.is_Removable) {
 						// Non removables should have been eliminated above, but since we
@@ -883,21 +940,35 @@ BOOL GetDevices(DWORD devnum)
 				}
 				if ((!enable_HDDs) && (!props.is_VHD) && (!props.is_CARD) &&
 					((score = IsHDD(drive_index, (uint16_t)props.vid, (uint16_t)props.pid, buffer)) > 0)) {
-					uprintf("Device eliminated because it was detected as a Hard Drive (score %d > 0)", score);
+					uprintf("Device eliminated because it was detected as a Hard Drive or SSD (score %d > 0)", score);
 					if (!list_non_usb_removable_drives)
-						uprintf("If this device is not a Hard Drive, please e-mail the author of this application");
+						uprintf("If this device is not a Hard Drive or SSD, please e-mail the author of this application");
 					uprintf("NOTE: You can enable the listing of Hard Drives under 'advanced drive properties'");
 					safe_free(devint_detail_data);
 					break;
-				} else if ((!enable_HDDs) && (props.is_CARD) && (GetDriveSize(drive_index) > MAX_DEFAULT_LIST_CARD_SIZE * GB)) {
-					uprintf("Device eliminated because it was detected as a card larger than %d GB", MAX_DEFAULT_LIST_CARD_SIZE);
+				} else if ((!enable_HDDs) && (props.is_CARD) && (drive_size > MAX_DEFAULT_LIST_CARD_SIZE)) {
+					uprintf("Device eliminated because it was detected as a card larger than %s",
+						SizeToHumanReadable(MAX_DEFAULT_LIST_CARD_SIZE, FALSE, FALSE));
 					uprintf("To use such a card, check 'List USB Hard Drives' under 'advanced drive properties'");
+					safe_free(devint_detail_data);
+					break;
+				} else if (props.is_VHD && IsMsDevDrive(drive_index)) {
+					uprintf("Device eliminated because it was detected as a Microsoft Dev Drive");
+					safe_free(devint_detail_data);
+					break;
+				} else if (IsFilteredDrive(drive_index)) {
 					safe_free(devint_detail_data);
 					break;
 				}
 				// Windows 10 19H1 mounts a 'PortableBaseLayer' for its Windows Sandbox feature => unlist those
 				if (safe_strcmp(label, windows_sandbox_vhd_label) == 0) {
 					uprintf("Device eliminated because it is a Windows Sandbox VHD");
+					safe_free(devint_detail_data);
+					break;
+				}
+				// Bitdefender now uses a special 32 MB VHD
+				if (props.is_VHD && safe_strnicmp(label, "Bitdefender", 11) == 0 && GetDriveSize(drive_index) <= 32 * MB) {
+					uprintf("Device eliminated because it is a Bitdefender VHD");
 					safe_free(devint_detail_data);
 					break;
 				}
@@ -909,11 +980,11 @@ BOOL GetDevices(DWORD devnum)
 
 				// The empty string is returned for drives that don't have any volumes assigned
 				if (drive_letters[0] == 0) {
-					entry = lmprintf(MSG_046, label, drive_number,
-						SizeToHumanReadable(GetDriveSize(drive_index), FALSE, use_fake_units));
+					display_name = lmprintf(MSG_046, label, drive_number,
+						SizeToHumanReadable(drive_size, FALSE, use_fake_units));
 				} else {
 					// Find the UEFI:TOGO partition(s) (and eliminate them form our listing)
-					for (k=0; drive_letters[k]; k++) {
+					for (k = 0; drive_letters[k]; k++) {
 						uefi_togo_check[0] = drive_letters[k];
 						if (PathFileExistsA(uefi_togo_check)) {
 							for (l=k; drive_letters[l]; l++)
@@ -923,14 +994,14 @@ BOOL GetDevices(DWORD devnum)
 					}
 					// We have multiple volumes assigned to the same device (multiple partitions)
 					// If that is the case, use "Multiple Volumes" instead of the label
-					static_strcpy(entry_msg, (((drive_letters[0] != 0) && (drive_letters[1] != 0))?
+					static_strcpy(display_msg, (((drive_letters[0] != 0) && (drive_letters[1] != 0))?
 						lmprintf(MSG_047):label));
 					for (k=0, remove_drive=0; drive_letters[k] && (!remove_drive); k++) {
 						// Append all the drive letters we detected
 						letter_name[2] = drive_letters[k];
 						if (right_to_left_mode)
-							static_strcat(entry_msg, RIGHT_TO_LEFT_MARK);
-						static_strcat(entry_msg, letter_name);
+							static_strcat(display_msg, RIGHT_TO_LEFT_MARK);
+						static_strcat(display_msg, letter_name);
 						if (drive_letters[k] == (PathGetDriveNumberU(app_dir) + 'A'))
 							remove_drive = 1;
 						if (drive_letters[k] == (PathGetDriveNumberU(system_dir) + 'A'))
@@ -938,25 +1009,32 @@ BOOL GetDevices(DWORD devnum)
 					}
 					// Make sure that we don't list any drive that should not be listed
 					if (remove_drive) {
-						uprintf("Removing %C: from the list: This is the %s!", drive_letters[--k],
+						uprintf("Removing %c: from the list: This is the %s!", toupper(drive_letters[--k]),
 							(remove_drive==1)?"disk from which " APPLICATION_NAME " is running":"system disk");
 						safe_free(devint_detail_data);
 						break;
 					}
-					safe_sprintf(&entry_msg[strlen(entry_msg)], sizeof(entry_msg) - strlen(entry_msg),
-						"%s [%s]", (right_to_left_mode)?RIGHT_TO_LEFT_MARK:"", SizeToHumanReadable(GetDriveSize(drive_index), FALSE, use_fake_units));
-					entry = entry_msg;
+					safe_sprintf(&display_msg[strlen(display_msg)], sizeof(display_msg) - strlen(display_msg) - 1,
+						"%s [%s]", (right_to_left_mode) ? RIGHT_TO_LEFT_MARK : "",
+						SizeToHumanReadable(drive_size, FALSE, use_fake_units));
+					display_name = display_msg;
 				}
 
-				// Must ensure that the combo box is UNSORTED for indexes to be the same
-				StrArrayAdd(&DriveId, device_instance_id, TRUE);
-				StrArrayAdd(&DriveName, buffer, TRUE);
-				StrArrayAdd(&DriveLabel, label, TRUE);
-				if ((hub_path != NULL) && (StrArrayAdd(&DriveHub, hub_path, TRUE) >= 0))
-					DrivePort[DriveHub.Index - 1] = props.port;
-
-				IGNORE_RETVAL(ComboBox_SetItemData(hDeviceList, ComboBox_AddStringU(hDeviceList, entry), drive_index));
-				maxwidth = max(maxwidth, GetEntryWidth(hDeviceList, entry));
+				rufus_drive[num_drives].index = drive_index;
+				rufus_drive[num_drives].id = safe_strdup(device_instance_id);
+				rufus_drive[num_drives].name = safe_strdup(buffer);
+				rufus_drive[num_drives].display_name = safe_strdup(display_name);
+				rufus_drive[num_drives].label = safe_strdup(label);
+				rufus_drive[num_drives].size = drive_size;
+				if_assert_fails(rufus_drive[num_drives].size != 0)
+					break;
+				if (hub_path != NULL) {
+					rufus_drive[num_drives].hub = safe_strdup(hub_path);
+					rufus_drive[num_drives].port = props.port;
+				}
+				num_drives++;
+				if (num_drives >= MAX_DRIVES)
+					uprintf("WARNING: Found more than %d drives - ignoring remaining ones...", MAX_DRIVES);
 				safe_free(devint_detail_data);
 				break;
 			}
@@ -964,6 +1042,30 @@ BOOL GetDevices(DWORD devnum)
 	}
 	SetupDiDestroyDeviceInfoList(dev_info);
 
+	// Reorder the drives by increasing size, using the "selection sort" algorithm
+	for (u = 0; u < num_drives - 1; u++) {
+		uint64_t min_drive_size = rufus_drive[u].size;
+		int min_index = u;
+		for (v = u + 1; v < num_drives; v++) {
+			if (rufus_drive[v].size < min_drive_size) {
+				min_drive_size = rufus_drive[v].size;
+				min_index = v;
+			}
+		}
+		if (min_index != u) {
+			RUFUS_DRIVE tmp;
+			memcpy(&tmp, &rufus_drive[u], sizeof(RUFUS_DRIVE));
+			memcpy(&rufus_drive[u], &rufus_drive[min_index], sizeof(RUFUS_DRIVE));
+			memcpy(&rufus_drive[min_index], &tmp, sizeof(RUFUS_DRIVE));
+		}
+	}
+
+	// Now populate the drive combo box
+	// NB: The combo box must have the UNSORTED attribute for indexes to remain the ones we assign
+	for (u = 0; u < num_drives; u++) {
+		IGNORE_RETVAL(ComboBox_SetItemData(hDeviceList, ComboBox_AddStringU(hDeviceList, rufus_drive[u].display_name), rufus_drive[u].index));
+		maxwidth = max(maxwidth, GetEntryWidth(hDeviceList, rufus_drive[u].display_name));
+	}
 	// Adjust the Dropdown width to the maximum text size
 	SendMessage(hDeviceList, CB_SETDROPPEDWIDTH, (WPARAM)maxwidth, 0);
 
